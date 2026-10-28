@@ -5,10 +5,10 @@
 
 /* Initialise I2C1 peripheral in slave mode and install IRQ handler.
  * Reads ADDR_PIN_0/1/2 to determine the 7-bit slave address (0x50-0x57).
- * Call once from Core 0 before i2c_slave_task(). */
+ * Call once from Core 1 before i2c_slave_task(). */
 void app_i2c_slave_init(void);
 
-/* Blocking Core 0 loop — waits for I2C transactions via __wfi().
+/* Blocking Core 1 loop. I2C commands are handled by its IRQ.
  * Never returns. */
 void i2c_slave_task(void);
 

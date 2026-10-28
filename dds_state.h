@@ -1,99 +1,54 @@
 #ifndef DDS_STATE_H
 #define DDS_STATE_H
 
-/* dds_state.h — shared DDS parameters, globals, and safe update function
- *
- * Include this header in both main.c and i2c_slave.c.
- * Single source of truth for:
- *   - SAMPLE_RATE_HZ, frequency/amplitude limits, ramp rate
- *   - extern declarations for the shared volatile globals
- *   - calc_phase_inc(), calc_amp_scale(), dds_update()              */
-
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "dds_tables.h"
 
-/* ── Timing and frequency limits ─────────────────────────────────────────────
- * SAMPLE_RATE_HZ was previously duplicated as the magic number 327973UL in
- * both main.c and i2c_slave.c. Now both include this header and share one
- * definition — changing it here updates everything automatically.            */
-#define SAMPLE_RATE_HZ  100000UL    /* Hz  — must divide evenly into 1,000,000 */
-#define FREQ_MIN_HZ     500UL       /* Hz  — minimum commanded frequency        */
-#define FREQ_MAX_HZ     10000UL     /* Hz  — maximum commanded frequency        */
-#define DAC_IOUT_MAX_UA 2000U       /* µA  — full-scale DAC output current      */
+/* Rev 1.1: REF5025, bipolar U5, U6 gain 1 + 499/24900, R5=499 ohms.
+ * Ideal low-frequency transfer, not measured calibration. */
+#define DAC_ZERO_CODE 32768U
+#define DAC_VREF_UV 2500000ULL
+#define HOWLAND_SENSE_OHMS 499ULL
+#define FILTER_GAIN_NUM 25399ULL
+#define FILTER_GAIN_DEN 24900ULL
+#define DAC_IOUT_MAX_UA 5000U
+#define DEFAULT_AMPLITUDE_UA 200U
+#define SAMPLE_RATE_HZ 100000UL
+#define SAMPLE_PERIOD_US (1000000UL / SAMPLE_RATE_HZ)
+#define FREQ_MIN_MHZ 500000UL
+#define FREQ_MAX_MHZ 10000000UL
+#define AMP_RAMP_UA_PER_SEC 100ULL
+#define RAMP_NUM (SAMPLE_RATE_HZ * DAC_VREF_UV * FILTER_GAIN_NUM)
+#define RAMP_DEN (AMP_RAMP_UA_PER_SEC * HOWLAND_SENSE_OHMS * 32768ULL * FILTER_GAIN_DEN)
+#define AMP_RAMP_INTERVAL ((uint32_t)((RAMP_NUM + RAMP_DEN - 1) / RAMP_DEN))
+#define DDS_FAULT_LEAD_DISCONNECTED 0x01U
+#define DDS_FAULT_TIMING 0x02U
 
-/* ── Amplitude ramp rate enforcement ────────────────────────────────────────
- * Hardware / safety requirement: current must ramp at ≤ 0.1 mA/sec,
- * both when starting and stopping stimulation.
- *
- * The ramp is implemented in the Core 1 timer ISR by stepping the applied
- * amplitude scale by 1 DAC count every AMP_RAMP_INTERVAL samples.
- *
- * Derivation:
- *   Full scale   = DAC_IOUT_MAX_UA = 2000 µA  →  scale 65536
- *   Max ramp     = 100 µA/sec
- *   µA per step  = DAC_IOUT_MAX_UA / 65536 = 0.03052 µA/count
- *   Steps/sec    = 100 µA/sec ÷ 0.03052 µA/count = 3276.8 steps/sec
- *   Interval     = SAMPLE_RATE_HZ / 3276.8 = 30.52 samples/step
- *   → step 1 count every 31 samples = 96.8 µA/sec  ✓ (within limit)        */
-#define AMP_RAMP_INTERVAL  31U      /* samples between 1-count amplitude steps */
-
-/* ── Shared volatile globals — defined in main.c ────────────────────────────
- * g_phase_inc      and g_wave_type are written atomically (single 32-bit
- *                  write on Cortex-M0+) so they take effect within one
- *                  sample with no risk of a torn read.
- *
- * g_amplitude_target  is the REQUESTED scale. The ISR ramps the APPLIED
- *                  scale toward this value at AMP_RAMP_INTERVAL to enforce
- *                  the ≤ 0.1 mA/sec limit. Core 0 never writes the applied
- *                  scale directly — only the target.
- *
- * g_output_enable  is no longer used to gate output. Enabling sets the
- *                  amplitude target to the requested value; disabling sets
- *                  the target to 0 so the ISR ramps down naturally.
- *                  The output is always running — it just ramps to silence. */
-extern volatile uint32_t    g_phase_inc;
+extern volatile uint32_t g_phase_inc;
 extern volatile wave_type_t g_wave_type;
-extern volatile uint32_t    g_amplitude_target;  /* requested scale — ISR ramps to this */
+/* Peak deviation from midscale in DAC codes. */
+extern volatile uint32_t g_amplitude_target;
+extern volatile bool g_lead_fault;
+extern volatile bool g_timing_fault;
 
-/* ── Phase increment ─────────────────────────────────────────────────────────
- * phase_inc = freq_hz × 2^32 / SAMPLE_RATE_HZ
- * 64-bit intermediate prevents overflow up to ~1 MHz.                        */
-static inline uint32_t calc_phase_inc(uint32_t freq_hz)
-{
-    return (uint32_t)(((uint64_t)freq_hz << 32) / SAMPLE_RATE_HZ);
+static inline uint32_t calc_phase_inc(uint32_t frequency_mHz) {
+    return (uint32_t)(((uint64_t)frequency_mHz << 32) /
+                      ((uint64_t)SAMPLE_RATE_HZ * 1000U));
 }
 
-/* ── Amplitude scale ─────────────────────────────────────────────────────────
- * Converts µA to a Q16 multiplier used by the ISR:
- *   output_sample = (lut[idx] * amplitude_scale) >> 16                       */
-static inline uint32_t calc_amp_scale(uint16_t amp_uA)
-{
-    if (amp_uA >= DAC_IOUT_MAX_UA) return 65536U;
-    return (uint32_t)((amp_uA * 65536ULL) / DAC_IOUT_MAX_UA);
+static inline uint32_t calc_amp_scale(uint16_t peak_uA) {
+    if (peak_uA > DAC_IOUT_MAX_UA) peak_uA = DAC_IOUT_MAX_UA;
+    return (uint32_t)((peak_uA * HOWLAND_SENSE_OHMS * 32768ULL * FILTER_GAIN_DEN) /
+                      (DAC_VREF_UV * FILTER_GAIN_NUM));
 }
 
-/* ── DDS parameter update ────────────────────────────────────────────────────
- * Call from Core 0 (i2c_slave.c) whenever a new command arrives.
- *
- * Frequency and waveform are written directly — each is a single atomic
- * 32-bit write on the Cortex-M0+, so the ISR can never read a torn value.
- * A one-sample glitch at a mid-output waveform change is imperceptible.
- *
- * Amplitude is never written directly. Instead g_amplitude_target is updated
- * and the ISR ramps the applied scale toward it at ≤ 0.1 mA/sec. This
- * enforces the hardware safety requirement automatically:
- *   - enable=true  → target set to requested scale → ISR ramps UP
- *   - enable=false → target set to 0              → ISR ramps DOWN to silence
- *
- * No disable/barrier/re-enable sequence needed — continuous output is
- * maintained throughout all parameter changes.                               */
-static inline void dds_update(uint32_t freq_hz, wave_type_t wave,
-                               uint32_t amp_scale, bool enable)
-{
-    g_phase_inc        = calc_phase_inc(freq_hz);
-    g_wave_type        = wave;
-    g_amplitude_target = enable ? amp_scale : 0U;
+static inline uint16_t dds_sample_code(uint16_t lut_sample, uint32_t peak_code) {
+    const uint32_t limit = calc_amp_scale(DAC_IOUT_MAX_UA);
+    if (peak_code > limit) peak_code = limit;
+    const int32_t centered = (int32_t)lut_sample - (int32_t)DAC_ZERO_CODE;
+    /* Bounded by 32768 * 32059, within signed 32 bits. */
+    const int32_t offset = (centered * (int32_t)peak_code) / 32768;
+    return (uint16_t)((int32_t)DAC_ZERO_CODE + offset);
 }
-
-#endif /* DDS_STATE_H */
+#endif
